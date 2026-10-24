@@ -29,24 +29,19 @@ Implemented and tested:
 - Inline commands (`PING\r\n`, `SET key value\r\n`) as an alternative to RESP
 - Binary-safe values (values may contain `\r\n`, NUL bytes, etc.)
 - Explicit protocol limits (argument count, bulk size, line length)
-- 66 unit tests
+- TCP server: accept loop, per-connection buffers, pipelined commands
+- 82 unit tests
 
 Not implemented yet:
 
-- TCP server (the protocol layer is transport-agnostic and already tested with
-  in-memory readers/writers)
-- Concurrency
+- Concurrency (the server handles one connection at a time)
 - TTL / expiration
 - Persistence
 - Eviction / memory limits
 
-`zig build run` currently initializes the store and exits. That is expected
-until the TCP server is wired into `main.zig`.
-
 ## Requirements
 
-- Zig master (`0.17.0`)
-  reader/writer interfaces
+- Zig master (`0.17.0`) with the new `std.Io` reader/writer interfaces
 - No external dependencies
 
 ## Build and test
@@ -54,20 +49,39 @@ until the TCP server is wired into `main.zig`.
 ```sh
 zig build        # build the executable
 zig build test   # run all unit tests
-zig build run    # start the program (currently a no-op)
+zig build run    # start the server on 127.0.0.1:6379
 ```
+
+The server blocks until the process is killed. In another terminal:
+
+```sh
+redis-cli -p 6379 ping          # PONG
+redis-cli -p 6379 set name john # OK
+redis-cli -p 6379 get name      # "john"
+```
+
+Without `redis-cli`, inline commands work over any TCP client:
+
+```sh
+printf 'PING\r\n' | nc -q 1 127.0.0.1 6379
+```
+
+Only one connection is served at a time for now; a second client waits until
+the first one disconnects.
 
 ## Layout
 
 ```
 build.zig
 src/
-  main.zig           entry point
+  main.zig           entry point: store + server
+  server.zig         TCP listener, accept loop, per-connection buffers
+  server_test.zig    TCP tests (loopback)
   store.zig          in-memory key-value store
   store_test.zig     store tests
   protocol.zig       RESP2 + inline command parsing and dispatch
   protocol_test.zig  protocol tests
-  tests.zig          test root that imports both test files
+  tests.zig          test root that imports all test files
 ```
 
 ## Design notes
@@ -103,6 +117,22 @@ Limits:
 - `max_bulk_len = 1 MiB`
 - `max_line_len = 4096`
 
+### Server
+
+`Server.serve` accepts one connection at a time, then runs
+`protocol.execute` in a loop and flushes after every command. Pipelined
+commands are consumed from the same buffer without extra syscalls.
+
+- The read buffer must be larger than `max_line_len` (8 KiB is used). Otherwise
+  `takeDelimiter` cannot see the delimiter and legal input is rejected as
+  `BadProtocol`.
+- Protocol and framing errors close only the current connection; listener
+  errors abort `serve`.
+- `stop` shuts the listening socket down, which is what wakes a blocked
+  `accept`. Closing the socket would not.
+- Bulk values larger than the buffer are streamed into the scratch allocator by
+  `readSliceAll`, so the buffer size does not limit value size.
+
 ### Testing
 
 - Protocol tests run entirely in memory with `std.Io.Reader.fixed` and
@@ -112,10 +142,18 @@ Limits:
 - Out-of-memory paths are exercised with `std.testing.FailingAllocator`.
 - Argument ownership is tested with `std.testing.Reader` and a one-byte
   artificial read limit, which forces the reader buffer to refill and rebase.
+- TCP tests open real loopback sockets on an ephemeral port. A watchdog thread
+  shuts the client down if the server stops responding, so a broken server
+  fails instead of hanging the suite.
 
 ## Roadmap
 
-1. TCP server: accept loop, per-connection buffers, `execute`, `flush`
+Done: TCP server (accept loop, per-connection buffers, `execute`, `flush` per
+command).
+
+Next:
+
+1. CLI flags (`--bind`, `--port`); the defaults are currently hardcoded
 2. Concurrency: thread-per-connection with a mutex, or sharded stores
 3. TTL: `SET ... EX`, `EXPIRE`, `TTL`, lazy expiration
 4. Persistence: append-only log and/or snapshots

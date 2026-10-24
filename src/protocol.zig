@@ -34,16 +34,16 @@ pub const Error = error{
 /// Owns one allocation per argument. Parsers fill `items[0..len]`; the caller
 /// must call `deinit` after the command has been dispatched.
 const Args = struct {
-    gpa: std.mem.Allocator,
+    allocator: std.mem.Allocator,
     items: [max_args][]u8 = undefined,
     len: usize = 0,
 
-    fn init(gpa: std.mem.Allocator) Args {
-        return .{ .gpa = gpa };
+    fn init(allocator: std.mem.Allocator) Args {
+        return .{ .allocator = allocator };
     }
 
     fn deinit(self: *Args) void {
-        for (self.items[0..self.len]) |item| self.gpa.free(item);
+        for (self.items[0..self.len]) |item| self.allocator.free(item);
         self.len = 0;
     }
 
@@ -55,10 +55,10 @@ const Args = struct {
 /// Reads commands from a byte stream.
 const Parser = struct {
     r: *std.Io.Reader,
-    gpa: std.mem.Allocator,
+    allocator: std.mem.Allocator,
 
-    fn init(r: *std.Io.Reader, gpa: std.mem.Allocator) Parser {
-        return .{ .r = r, .gpa = gpa };
+    fn init(r: *std.Io.Reader, allocator: std.mem.Allocator) Parser {
+        return .{ .r = r, .allocator = allocator };
     }
 
     /// Parses one command into `args`.
@@ -90,7 +90,7 @@ const Parser = struct {
         while (tokens.next()) |token| {
             if (args.len == max_args) return error.BadProtocol;
 
-            const owned = try args.gpa.dupe(u8, token);
+            const owned = try args.allocator.dupe(u8, token);
             args.items[args.len] = owned;
             args.len += 1;
         }
@@ -112,7 +112,7 @@ const Parser = struct {
 
             const len = try self.parseSize(length_line[1..], max_bulk_len);
 
-            const body = try args.gpa.alloc(u8, len);
+            const body = try args.allocator.alloc(u8, len);
             args.items[args.len] = body;
             args.len += 1;
 
@@ -249,12 +249,12 @@ const Dispatcher = struct {
 /// The writer is not flushed; the server flushes once per command.
 pub fn execute(
     store: *Store,
-    scratch: std.mem.Allocator,
+    allocator: std.mem.Allocator,
     r: *std.Io.Reader,
     w: *std.Io.Writer,
 ) Error!void {
-    var parser: Parser = .init(r, scratch);
-    var args: Args = .init(scratch);
+    var parser: Parser = .init(r, allocator);
+    var args: Args = .init(allocator);
 
     if (!try parser.next(&args)) return error.EndOfStream;
     defer args.deinit();

@@ -2,23 +2,30 @@
 
 const std = @import("std");
 const Store = @import("store.zig").Store;
+const Clock = @import("store.zig").Clock;
+const Item = @import("store.zig").Item;
+const Ttl = @import("store.zig").Ttl;
 
 const testing = std.testing;
 
-fn expectValue(store: *const Store, key: []const u8, expected: []const u8) !void {
+// Updated for P3: `get`/`contains`/`count` become mutating once lazy expiry
+// lands, so these helpers take `*Store`. A `*Store` also satisfies the
+// current `*const` receivers, so the helpers compile before and after P3.
+
+fn expectValue(store: *Store, key: []const u8, expected: []const u8) !void {
     const actual = store.get(key) orelse return error.MissingKey;
     try testing.expectEqualStrings(expected, actual);
 }
 
-fn expectMissing(store: *const Store, key: []const u8) !void {
+fn expectMissing(store: *Store, key: []const u8) !void {
     try testing.expect(store.get(key) == null);
 }
 
-fn expectCount(store: *const Store, expected: usize) !void {
+fn expectCount(store: *Store, expected: usize) !void {
     try testing.expectEqual(expected, store.count());
 }
 
-fn expectContains(store: *const Store, key: []const u8, expected: bool) !void {
+fn expectContains(store: *Store, key: []const u8, expected: bool) !void {
     try testing.expectEqual(expected, store.contains(key));
 }
 
@@ -403,4 +410,327 @@ test "OOM: failing to allocate the key frees the allocated value" {
 
     try expectMissing(&store, "name");
     try expectCount(&store, 0);
+}
+
+// P3: expiry metadata and lazy expiration
+
+const FakeClock = struct {
+    now_ms: i64 = 0,
+
+    fn nowMs(ctx: ?*anyopaque) i64 {
+        const self: *FakeClock = @ptrCast(@alignCast(ctx.?));
+        return self.now_ms;
+    }
+
+    fn clock(self: *FakeClock) Clock {
+        return .{ .ctx = self, .now_ms_fn = nowMs };
+    }
+};
+
+fn newTimedStore(clock: *FakeClock) Store {
+    var store = Store.init(testing.allocator);
+    store.clock = clock.clock();
+    return store;
+}
+
+fn expectTtl(store_ptr: *Store, key: []const u8, expected: Ttl) !void {
+    switch (expected) {
+        .key_missing => switch (store_ptr.ttl(key)) {
+            .key_missing => {},
+            else => return error.TtlMismatch,
+        },
+        .no_expiry => switch (store_ptr.ttl(key)) {
+            .no_expiry => {},
+            else => return error.TtlMismatch,
+        },
+        .remaining_ms => |ms| switch (store_ptr.ttl(key)) {
+            .remaining_ms => |actual| try testing.expectEqual(ms, actual),
+            else => return error.TtlMismatch,
+        },
+    }
+}
+
+test "clock: default reads the system wall clock" {
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+
+    // Any host running this test is past 2024-01-01 (Unix epoch ms).
+    try testing.expect(store.clock.nowMs() > 1_704_067_200_000);
+}
+
+test "Item: carries exactly the D4 metadata fields" {
+    const info = @typeInfo(Item).@"struct";
+    try testing.expectEqual(@as(usize, 2), info.field_names.len);
+    try testing.expectEqualStrings("value", info.field_names[0]);
+    try testing.expectEqualStrings("expires_at_ms", info.field_names[1]);
+}
+
+test "setWithOptions: value without a deadline behaves like set" {
+    var clock = FakeClock{ .now_ms = 1_000 };
+    var store = newTimedStore(&clock);
+    defer store.deinit();
+
+    try store.setWithOptions("k", "v", .{});
+    try expectValue(&store, "k", "v");
+    try expectCount(&store, 1);
+    try expectTtl(&store, "k", .no_expiry);
+}
+
+test "setWithOptions: future deadline keeps the item readable" {
+    var clock = FakeClock{ .now_ms = 1_000 };
+    var store = newTimedStore(&clock);
+    defer store.deinit();
+
+    try store.setWithOptions("k", "v", .{ .expires_at_ms = 2_000 });
+    try expectValue(&store, "k", "v");
+    try expectTtl(&store, "k", .{ .remaining_ms = 1_000 });
+}
+
+test "setWithOptions: binary-safe value with a deadline" {
+    var clock = FakeClock{ .now_ms = 1_000 };
+    var store = newTimedStore(&clock);
+    defer store.deinit();
+
+    const value = "\x00ab\r\n\xff";
+    try store.setWithOptions("bin", value, .{ .expires_at_ms = 60_000 });
+
+    const stored = store.get("bin") orelse return error.MissingKey;
+    try testing.expectEqualSlices(u8, value, stored);
+}
+
+test "expiry boundary: deadline equal to now counts as expired" {
+    var clock = FakeClock{ .now_ms = 1_000 };
+    var store = newTimedStore(&clock);
+    defer store.deinit();
+
+    try store.setWithOptions("k", "v", .{ .expires_at_ms = 1_000 });
+    try expectMissing(&store, "k");
+}
+
+test "lazy expiry: get frees the item and reports it missing" {
+    var clock = FakeClock{ .now_ms = 1_000 };
+    var store = newTimedStore(&clock);
+    defer store.deinit();
+
+    try store.setWithOptions("k", "v", .{ .expires_at_ms = 1_500 });
+    clock.now_ms = 1_600;
+
+    // The entry count dropping to zero is the observable proof that the
+    // purge freed the item immediately (the leak check at deinit then only
+    // proves there is nothing left to free).
+    try expectMissing(&store, "k");
+    try expectCount(&store, 0);
+}
+
+test "lazy expiry: contains treats an expired item as absent" {
+    var clock = FakeClock{ .now_ms = 1_000 };
+    var store = newTimedStore(&clock);
+    defer store.deinit();
+
+    try store.setWithOptions("k", "v", .{ .expires_at_ms = 1_500 });
+    clock.now_ms = 2_000;
+
+    try expectContains(&store, "k", false);
+}
+
+test "lazy expiry: getCopy treats an expired item as absent" {
+    var clock = FakeClock{ .now_ms = 1_000 };
+    var store = newTimedStore(&clock);
+    defer store.deinit();
+
+    try store.setWithOptions("k", "v", .{ .expires_at_ms = 1_500 });
+    clock.now_ms = 2_000;
+
+    try testing.expect((try store.getCopy("k")) == null);
+    try expectCount(&store, 0);
+}
+
+test "lazy expiry: remove reports an expired item as missing" {
+    var clock = FakeClock{ .now_ms = 1_000 };
+    var store = newTimedStore(&clock);
+    defer store.deinit();
+
+    try store.setWithOptions("k", "v", .{ .expires_at_ms = 1_500 });
+    try store.set("other", "kept");
+    clock.now_ms = 2_000;
+
+    try expectRemoved(&store, "k", false);
+    try expectCount(&store, 1);
+    try expectValue(&store, "other", "kept");
+}
+
+test "lazy expiry: count purges every expired item" {
+    var clock = FakeClock{ .now_ms = 1_000 };
+    var store = newTimedStore(&clock);
+    defer store.deinit();
+
+    try store.setWithOptions("a", "1", .{ .expires_at_ms = 1_500 });
+    try store.set("b", "2");
+    try store.setWithOptions("c", "3", .{ .expires_at_ms = 1_400 });
+    clock.now_ms = 1_600;
+
+    try expectCount(&store, 1);
+    try expectValue(&store, "b", "2");
+}
+
+test "set: overwriting without options clears the deadline" {
+    var clock = FakeClock{ .now_ms = 1_000 };
+    var store = newTimedStore(&clock);
+    defer store.deinit();
+
+    try store.setWithOptions("k", "v", .{ .expires_at_ms = 2_000 });
+    try store.set("k", "v2");
+
+    try expectTtl(&store, "k", .no_expiry);
+    try expectValue(&store, "k", "v2");
+}
+
+test "setWithOptions: storing without a deadline clears a previous one" {
+    var clock = FakeClock{ .now_ms = 1_000 };
+    var store = newTimedStore(&clock);
+    defer store.deinit();
+
+    try store.setWithOptions("k", "v", .{ .expires_at_ms = 2_000 });
+    try store.setWithOptions("k", "v2", .{});
+
+    try expectTtl(&store, "k", .no_expiry);
+}
+
+test "setWithOptions: re-setting replaces the deadline" {
+    var clock = FakeClock{ .now_ms = 1_000 };
+    var store = newTimedStore(&clock);
+    defer store.deinit();
+
+    try store.setWithOptions("k", "v", .{ .expires_at_ms = 2_000 });
+    try store.setWithOptions("k", "v2", .{ .expires_at_ms = 5_000 });
+
+    try expectTtl(&store, "k", .{ .remaining_ms = 4_000 });
+}
+
+test "expire: sets the deadline on a live key" {
+    var clock = FakeClock{ .now_ms = 1_000 };
+    var store = newTimedStore(&clock);
+    defer store.deinit();
+
+    try store.set("k", "v");
+    try testing.expect(store.expire("k", 2_000));
+
+    try expectTtl(&store, "k", .{ .remaining_ms = 1_000 });
+    try expectValue(&store, "k", "v");
+}
+
+test "expire: missing key returns false" {
+    var clock = FakeClock{ .now_ms = 1_000 };
+    var store = newTimedStore(&clock);
+    defer store.deinit();
+
+    try testing.expect(!store.expire("nope", 2_000));
+    try expectCount(&store, 0);
+}
+
+test "expire: already-expired key returns false and is purged" {
+    var clock = FakeClock{ .now_ms = 1_000 };
+    var store = newTimedStore(&clock);
+    defer store.deinit();
+
+    try store.setWithOptions("k", "v", .{ .expires_at_ms = 1_500 });
+    clock.now_ms = 2_000;
+
+    try testing.expect(!store.expire("k", 9_000));
+    try expectCount(&store, 0);
+}
+
+test "expire: deadline in the past is accepted and purges on access" {
+    var clock = FakeClock{ .now_ms = 1_000 };
+    var store = newTimedStore(&clock);
+    defer store.deinit();
+
+    try store.set("k", "v");
+
+    // Redis semantics: EXPIRE with a non-positive TTL deletes the key and
+    // replies 1; here the past deadline makes the key vanish lazily.
+    try testing.expect(store.expire("k", clock.now_ms - 100));
+
+    try expectMissing(&store, "k");
+    try expectCount(&store, 0);
+}
+
+test "ttl: expired key counts as missing" {
+    var clock = FakeClock{ .now_ms = 1_000 };
+    var store = newTimedStore(&clock);
+    defer store.deinit();
+
+    try store.setWithOptions("k", "v", .{ .expires_at_ms = 1_500 });
+    clock.now_ms = 1_600;
+
+    try expectTtl(&store, "k", .key_missing);
+    try expectCount(&store, 0);
+}
+
+test "persist: removes the deadline and keeps the value" {
+    var clock = FakeClock{ .now_ms = 1_000 };
+    var store = newTimedStore(&clock);
+    defer store.deinit();
+
+    try store.setWithOptions("k", "v", .{ .expires_at_ms = 2_000 });
+    try testing.expect(store.persist("k"));
+
+    try expectTtl(&store, "k", .no_expiry);
+    try expectValue(&store, "k", "v");
+}
+
+test "persist: key without a deadline returns false" {
+    var clock = FakeClock{ .now_ms = 1_000 };
+    var store = newTimedStore(&clock);
+    defer store.deinit();
+
+    try store.set("k", "v");
+    try testing.expect(!store.persist("k"));
+}
+
+test "persist: missing key returns false" {
+    var clock = FakeClock{ .now_ms = 1_000 };
+    var store = newTimedStore(&clock);
+    defer store.deinit();
+
+    try testing.expect(!store.persist("nope"));
+}
+
+test "persist: expired key returns false and is purged" {
+    var clock = FakeClock{ .now_ms = 1_000 };
+    var store = newTimedStore(&clock);
+    defer store.deinit();
+
+    try store.setWithOptions("k", "v", .{ .expires_at_ms = 1_500 });
+    clock.now_ms = 2_000;
+
+    try testing.expect(!store.persist("k"));
+    try expectCount(&store, 0);
+}
+
+test "OOM: setWithOptions failure leaves the store clean" {
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    var store = Store.init(failing.allocator());
+    defer store.deinit();
+
+    try testing.expectError(
+        error.OutOfMemory,
+        store.setWithOptions("k", "v", .{ .expires_at_ms = 2_000 }),
+    );
+
+    try expectMissing(&store, "k");
+    try expectCount(&store, 0);
+}
+
+test "deinit: frees items whose deadline passed without access" {
+    var clock = FakeClock{ .now_ms = 1_000 };
+    var store = newTimedStore(&clock);
+    defer store.deinit();
+
+    try store.setWithOptions("stale", "v", .{ .expires_at_ms = 1_500 });
+    try store.set("fresh", "v");
+    clock.now_ms = 9_000;
+
+    // No lazy purge is triggered; the deferred deinit (with the
+    // leak-checking allocator) must still free both items exactly once.
 }

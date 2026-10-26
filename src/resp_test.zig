@@ -92,6 +92,59 @@ fn expectInvalidArity(input: []const u8, name: []const u8) !void {
     }
 }
 
+fn expectInvalidSyntax(input: []const u8) !void {
+    var parsed = try read(input);
+    defer parsed.deinit();
+
+    switch (parsed.command) {
+        .invalid => |err| switch (err) {
+            .syntax_error => {},
+            else => return error.ExpectedSyntaxError,
+        },
+        else => return error.ExpectedInvalidCommand,
+    }
+}
+
+fn expectInvalidValue(input: []const u8) !void {
+    var parsed = try read(input);
+    defer parsed.deinit();
+
+    switch (parsed.command) {
+        .invalid => |err| switch (err) {
+            .value_not_integer => {},
+            else => return error.ExpectedValueNotInteger,
+        },
+        else => return error.ExpectedInvalidCommand,
+    }
+}
+
+fn expectInvalidExpireTime(input: []const u8, name: []const u8) !void {
+    var parsed = try read(input);
+    defer parsed.deinit();
+
+    switch (parsed.command) {
+        .invalid => |err| switch (err) {
+            .invalid_expire => |actual| try testing.expectEqualStrings(name, actual),
+            else => return error.ExpectedInvalidExpire,
+        },
+        else => return error.ExpectedInvalidCommand,
+    }
+}
+
+fn expectRelativeMs(expiry: engine.Expiry, expected: i64) !void {
+    switch (expiry) {
+        .relative_ms => |ms| try testing.expectEqual(expected, ms),
+        .absolute_ms => return error.ExpectedRelativeExpiry,
+    }
+}
+
+fn expectAbsoluteMs(expiry: engine.Expiry, expected: i64) !void {
+    switch (expiry) {
+        .relative_ms => return error.ExpectedAbsoluteExpiry,
+        .absolute_ms => |ms| try testing.expectEqual(expected, ms),
+    }
+}
+
 // writeReply
 
 test "writeReply: simple strings" {
@@ -254,7 +307,9 @@ test "readCommand: unknown RESP command preserves its spelling" {
 test "readCommand: wrong arity uses the canonical command name" {
     try expectInvalidArity("PING a b\r\n", "ping");
     try expectInvalidArity("SET k\r\n", "set");
-    try expectInvalidArity("SET k v extra\r\n", "set");
+    // Spec fix (P3): `SET k v extra` is an unknown option in Redis, not an
+    // arity error. It stays an arity error only with fewer than 3 arguments.
+    try expectInvalidSyntax("SET k v extra\r\n");
     try expectInvalidArity("GET k v\r\n", "get");
     try expectInvalidArity("DEL\r\n", "del");
     try expectInvalidArity("EXISTS\r\n", "exists");
@@ -562,5 +617,290 @@ test "session: pipelined commands are answered in order" {
             "*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n" ++
             "*2\r\n$3\r\nGET\r\n$1\r\na\r\n",
         "+PONG\r\n+OK\r\n$1\r\n1\r\n",
+    );
+}
+
+// P3: SET expiry options
+
+test "readCommand: SET with EX parses a relative seconds expiry" {
+    var parsed = try read("*5\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n$2\r\nEX\r\n$1\r\n5\r\n");
+    defer parsed.deinit();
+
+    switch (parsed.command) {
+        .set => |set| {
+            try testing.expectEqualStrings("k", set.key);
+            try testing.expectEqualStrings("v", set.value);
+            try expectRelativeMs(set.expire.?, 5_000);
+        },
+        else => return error.ExpectedSet,
+    }
+}
+
+test "readCommand: SET with PX parses a relative milliseconds expiry" {
+    var parsed = try read("*5\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n$2\r\nPX\r\n$3\r\n500\r\n");
+    defer parsed.deinit();
+
+    switch (parsed.command) {
+        .set => |set| try expectRelativeMs(set.expire.?, 500),
+        else => return error.ExpectedSet,
+    }
+}
+
+test "readCommand: SET with EXAT parses an absolute milliseconds expiry" {
+    var parsed = try read("*5\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n$4\r\nEXAT\r\n$10\r\n1700000000\r\n");
+    defer parsed.deinit();
+
+    switch (parsed.command) {
+        .set => |set| try expectAbsoluteMs(set.expire.?, 1_700_000_000_000),
+        else => return error.ExpectedSet,
+    }
+}
+
+test "readCommand: SET with PXAT parses an absolute milliseconds expiry" {
+    var parsed = try read("*5\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n$4\r\nPXAT\r\n$13\r\n1700000000000\r\n");
+    defer parsed.deinit();
+
+    switch (parsed.command) {
+        .set => |set| try expectAbsoluteMs(set.expire.?, 1_700_000_000_000),
+        else => return error.ExpectedSet,
+    }
+}
+
+test "readCommand: SET without options has no expiry" {
+    var parsed = try read("*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n");
+    defer parsed.deinit();
+
+    switch (parsed.command) {
+        .set => |set| try testing.expect(set.expire == null),
+        else => return error.ExpectedSet,
+    }
+}
+
+test "readCommand: SET expiry options work via inline commands" {
+    var parsed = try read("SET k v EX 5\r\n");
+    defer parsed.deinit();
+
+    switch (parsed.command) {
+        .set => |set| {
+            try testing.expectEqualStrings("k", set.key);
+            try testing.expectEqualStrings("v", set.value);
+            try expectRelativeMs(set.expire.?, 5_000);
+        },
+        else => return error.ExpectedSet,
+    }
+}
+
+test "readCommand: SET expiry value overflow is an invalid expire error" {
+    // 9999999999999999 seconds does not fit in i64 milliseconds; Redis
+    // replies "invalid expire time" for values that would overflow.
+    try expectInvalidExpireTime("*5\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n$2\r\nEX\r\n$16\r\n9999999999999999\r\n", "set");
+}
+
+test "readCommand: SET expiry non-integer is a value error" {
+    try expectInvalidValue("*5\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n$2\r\nEX\r\n$3\r\nabc\r\n");
+}
+
+test "readCommand: SET unknown option is a syntax error" {
+    try expectInvalidSyntax("*4\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n$6\r\nBADOPT\r\n");
+}
+
+test "readCommand: SET duplicate expiry option is a syntax error" {
+    // Deviation from Redis 8, which accepts a repeated option and keeps the
+    // last value; no client sends this and rejecting it is simpler.
+    try expectInvalidSyntax("*7\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n$2\r\nEX\r\n$1\r\n5\r\n$2\r\nEX\r\n$1\r\n6\r\n");
+}
+
+test "readCommand: SET mixed expiry options are a syntax error" {
+    try expectInvalidSyntax("*7\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n$2\r\nEX\r\n$1\r\n5\r\n$2\r\nPX\r\n$4\r\n6000\r\n");
+}
+
+test "readCommand: SET expiry option without a value is a syntax error" {
+    try expectInvalidSyntax("SET k v EX\r\n");
+}
+
+test "readCommand: SET unsupported options are syntax errors until P7" {
+    // NX/XX arrive with P7 (setMode); KEEPTTL and GET are out of scope.
+    // Redis accepts all of them today; this is a documented deviation.
+    try expectInvalidSyntax("SET k v NX\r\n");
+    try expectInvalidSyntax("SET k v XX\r\n");
+    try expectInvalidSyntax("SET k v KEEPTTL\r\n");
+    try expectInvalidSyntax("SET k v GET\r\n");
+}
+
+// P3: TTL-family commands
+
+test "readCommand: TTL parses a seconds lookup" {
+    var parsed = try read("*2\r\n$3\r\nTTL\r\n$1\r\nk\r\n");
+    defer parsed.deinit();
+
+    switch (parsed.command) {
+        .ttl => |ttl| {
+            try testing.expectEqualStrings("k", ttl.key);
+            try testing.expectEqual(engine.TimeUnit.seconds, ttl.unit);
+        },
+        else => return error.ExpectedTtl,
+    }
+}
+
+test "readCommand: PTTL parses a milliseconds lookup" {
+    var parsed = try read("PTTL k\r\n");
+    defer parsed.deinit();
+
+    switch (parsed.command) {
+        .ttl => |ttl| {
+            try testing.expectEqualStrings("k", ttl.key);
+            try testing.expectEqual(engine.TimeUnit.milliseconds, ttl.unit);
+        },
+        else => return error.ExpectedTtl,
+    }
+}
+
+test "readCommand: EXPIRE parses a relative seconds expiry" {
+    var parsed = try read("*3\r\n$6\r\nEXPIRE\r\n$1\r\nk\r\n$1\r\n5\r\n");
+    defer parsed.deinit();
+
+    switch (parsed.command) {
+        .expire => |expire| {
+            try testing.expectEqualStrings("k", expire.key);
+            try expectRelativeMs(expire.expiry, 5_000);
+        },
+        else => return error.ExpectedExpire,
+    }
+}
+
+test "readCommand: PEXPIRE parses a relative milliseconds expiry" {
+    var parsed = try read("*3\r\n$7\r\nPEXPIRE\r\n$1\r\nk\r\n$3\r\n500\r\n");
+    defer parsed.deinit();
+
+    switch (parsed.command) {
+        .expire => |expire| try expectRelativeMs(expire.expiry, 500),
+        else => return error.ExpectedExpire,
+    }
+}
+
+test "readCommand: PERSIST parses a key" {
+    var parsed = try read("*2\r\n$7\r\nPERSIST\r\n$1\r\nk\r\n");
+    defer parsed.deinit();
+
+    switch (parsed.command) {
+        .persist => |persist| try testing.expectEqualStrings("k", persist.key),
+        else => return error.ExpectedPersist,
+    }
+}
+
+test "readCommand: expire-family integer errors are value errors" {
+    try expectInvalidValue("*3\r\n$6\r\nEXPIRE\r\n$1\r\nk\r\n$3\r\nabc\r\n");
+    try expectInvalidValue("PEXPIRE k abc\r\n");
+}
+
+test "readCommand: EXPIRE value overflow is an invalid expire error" {
+    try expectInvalidExpireTime("*3\r\n$6\r\nEXPIRE\r\n$1\r\nk\r\n$16\r\n9999999999999999\r\n", "expire");
+}
+
+test "readCommand: TTL-family arity errors use the canonical name" {
+    try expectInvalidArity("TTL\r\n", "ttl");
+    try expectInvalidArity("TTL k extra\r\n", "ttl");
+    try expectInvalidArity("PTTL\r\n", "pttl");
+    try expectInvalidArity("PTTL k extra\r\n", "pttl");
+    try expectInvalidArity("EXPIRE k\r\n", "expire");
+    try expectInvalidArity("EXPIRE k 1 extra\r\n", "expire");
+    try expectInvalidArity("PEXPIRE k\r\n", "pexpire");
+    try expectInvalidArity("PERSIST\r\n", "persist");
+    try expectInvalidArity("PERSIST k extra\r\n", "persist");
+}
+
+test "readCommand: expiry command names are case-insensitive" {
+    var parsed = try read("eXpIrE k 5\r\n");
+    defer parsed.deinit();
+
+    switch (parsed.command) {
+        .expire => |expire| try expectRelativeMs(expire.expiry, 5_000),
+        else => return error.ExpectedExpire,
+    }
+}
+
+// P3: new reply encodings
+
+test "writeReply: negative integers" {
+    try expectWritten(.{ .int = -2 }, ":-2\r\n");
+}
+
+test "writeReply: value error replies" {
+    // Byte-exact strings verified against redis-server 8.8.2.
+    try expectWritten(
+        .{ .err = .{ .invalid_expire = "set" } },
+        "-ERR invalid expire time in 'set' command\r\n",
+    );
+    try expectWritten(.{ .err = .value_not_integer }, "-ERR value is not an integer or out of range\r\n");
+    try expectWritten(.{ .err = .syntax_error }, "-ERR syntax error\r\n");
+}
+
+// P3: sessions (deterministic without clock control)
+
+test "session: SET with an EXAT deadline in the past expires immediately" {
+    var store = newStore();
+    defer store.deinit();
+
+    try expectSession(
+        &store,
+        "SET k v EXAT 1\r\nEXISTS k\r\nTTL k\r\nGET k\r\n",
+        "+OK\r\n:0\r\n:-2\r\n$-1\r\n",
+    );
+}
+
+test "session: SET with a far-future EXAT keeps the key" {
+    var store = newStore();
+    defer store.deinit();
+
+    // Year 2286; any host clock is before it. PERSIST removes the deadline
+    // without needing to know it, making the session deterministic.
+    try expectSession(
+        &store,
+        "SET k v EXAT 9999999999\r\nEXISTS k\r\nPERSIST k\r\nTTL k\r\n",
+        "+OK\r\n:1\r\n:1\r\n:-1\r\n",
+    );
+}
+
+test "session: EXPIRE with zero deletes the key" {
+    var store = newStore();
+    defer store.deinit();
+
+    try expectSession(
+        &store,
+        "SET k v\r\nEXPIRE k 0\r\nEXISTS k\r\n",
+        "+OK\r\n:1\r\n:0\r\n",
+    );
+}
+
+test "session: SET with EX zero is an invalid expire error and the connection survives" {
+    var store = newStore();
+    defer store.deinit();
+
+    try expectSession(
+        &store,
+        "SET k v EX 0\r\nPING\r\n",
+        "-ERR invalid expire time in 'set' command\r\n+PONG\r\n",
+    );
+}
+
+test "session: unknown SET option is a syntax error and the connection survives" {
+    var store = newStore();
+    defer store.deinit();
+
+    try expectSession(
+        &store,
+        "SET k v NOPE\r\nPING\r\n",
+        "-ERR syntax error\r\n+PONG\r\n",
+    );
+}
+
+test "session: integer parse failure keeps the connection usable" {
+    var store = newStore();
+    defer store.deinit();
+
+    try expectSession(
+        &store,
+        "EXPIRE k abc\r\nPING\r\n",
+        "-ERR value is not an integer or out of range\r\n+PONG\r\n",
     );
 }

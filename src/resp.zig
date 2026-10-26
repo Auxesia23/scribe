@@ -37,6 +37,13 @@ pub const Error = error{
     OutOfMemory,
 };
 
+/// Parses a decimal i64 argument. Returns null when the text is not an
+/// integer or out of range (Redis: "value is not an integer or out of
+/// range").
+fn parseI64(text: []const u8) ?i64 {
+    return std.fmt.parseInt(i64, text, 10) catch null;
+}
+
 /// Parses one command at a time from a reader.
 const Parser = struct {
     r: *std.Io.Reader,
@@ -66,8 +73,9 @@ const Parser = struct {
 
     /// Maps parsed arguments to an engine command.
     ///
-    /// Command-level errors (unknown command, wrong arity, empty command) are
-    /// represented as `Command.invalid`, not as Zig errors.
+    /// Command-level errors (unknown command, wrong arity, bad SET options,
+    /// empty command) are represented as `Command.invalid`, not as Zig
+    /// errors.
     fn mapCommand(self: *const Parser) engine.Command {
         const args = self.args.items;
 
@@ -82,8 +90,53 @@ const Parser = struct {
         }
 
         if (std.ascii.eqlIgnoreCase(cmd, "set")) {
-            if (args.len != 3) return .{ .invalid = .{ .wrong_arity = "set" } };
-            return .{ .set = .{ .key = args[1], .value = args[2] } };
+            if (args.len < 3) return .{ .invalid = .{ .wrong_arity = "set" } };
+
+            // Options: at most one of EX/PX/EXAT/PXAT, each with a value.
+            // NX/XX/GET/KEEPTTL arrive with P7, so anything else (and any
+            // second expiry option) is a syntax error — a documented
+            // deviation from Redis 8, which accepts repeated options.
+            var expire: ?engine.Expiry = null;
+            var i: usize = 3;
+            while (i < args.len) : (i += 2) {
+                // An option must always come with its value.
+                if (i + 1 >= args.len) return .{ .invalid = .syntax_error };
+
+                if (expire != null) return .{ .invalid = .syntax_error };
+
+                const opt = args[i];
+                const raw = args[i + 1];
+
+                if (std.ascii.eqlIgnoreCase(opt, "EX") or
+                    std.ascii.eqlIgnoreCase(opt, "EXAT"))
+                {
+                    const seconds = parseI64(raw) orelse
+                        return .{ .invalid = .value_not_integer };
+                    // Overflow here is "invalid expire time", not a value
+                    // error (getExpireMillisecondsOrReply in t_string.c).
+                    const ms = std.math.mul(i64, seconds, std.time.ms_per_s) catch
+                        return .{ .invalid = .{ .invalid_expire = "set" } };
+                    if (std.ascii.eqlIgnoreCase(opt, "EX")) {
+                        expire = .{ .relative_ms = ms };
+                    } else {
+                        expire = .{ .absolute_ms = ms };
+                    }
+                } else if (std.ascii.eqlIgnoreCase(opt, "PX") or
+                    std.ascii.eqlIgnoreCase(opt, "PXAT"))
+                {
+                    const ms = parseI64(raw) orelse
+                        return .{ .invalid = .value_not_integer };
+                    if (std.ascii.eqlIgnoreCase(opt, "PX")) {
+                        expire = .{ .relative_ms = ms };
+                    } else {
+                        expire = .{ .absolute_ms = ms };
+                    }
+                } else {
+                    return .{ .invalid = .syntax_error };
+                }
+            }
+
+            return .{ .set = .{ .key = args[1], .value = args[2], .expire = expire } };
         }
 
         if (std.ascii.eqlIgnoreCase(cmd, "get")) {
@@ -99,6 +152,45 @@ const Parser = struct {
         if (std.ascii.eqlIgnoreCase(cmd, "exists")) {
             if (args.len < 2) return .{ .invalid = .{ .wrong_arity = "exists" } };
             return .{ .exists = .{ .keys = args[1..] } };
+        }
+
+        if (std.ascii.eqlIgnoreCase(cmd, "ttl")) {
+            if (args.len != 2) return .{ .invalid = .{ .wrong_arity = "ttl" } };
+            return .{ .ttl = .{ .key = args[1], .unit = .seconds } };
+        }
+
+        if (std.ascii.eqlIgnoreCase(cmd, "pttl")) {
+            if (args.len != 2) return .{ .invalid = .{ .wrong_arity = "pttl" } };
+            return .{ .ttl = .{ .key = args[1], .unit = .milliseconds } };
+        }
+
+        if (std.ascii.eqlIgnoreCase(cmd, "expire") or
+            std.ascii.eqlIgnoreCase(cmd, "pexpire"))
+        {
+            const is_expire = std.ascii.eqlIgnoreCase(cmd, "expire");
+            if (args.len != 3) {
+                const name: []const u8 = if (is_expire) "expire" else "pexpire";
+                return .{ .invalid = .{ .wrong_arity = name } };
+            }
+
+            if (is_expire) {
+                // EXPIRE takes seconds; overflow to milliseconds is an
+                // "invalid expire time" (same special case as SET).
+                const seconds = parseI64(args[2]) orelse
+                    return .{ .invalid = .value_not_integer };
+                const ms = std.math.mul(i64, seconds, std.time.ms_per_s) catch
+                    return .{ .invalid = .{ .invalid_expire = "expire" } };
+                return .{ .expire = .{ .key = args[1], .expiry = .{ .relative_ms = ms } } };
+            }
+
+            const ms = parseI64(args[2]) orelse
+                return .{ .invalid = .value_not_integer };
+            return .{ .expire = .{ .key = args[1], .expiry = .{ .relative_ms = ms } } };
+        }
+
+        if (std.ascii.eqlIgnoreCase(cmd, "persist")) {
+            if (args.len != 2) return .{ .invalid = .{ .wrong_arity = "persist" } };
+            return .{ .persist = .{ .key = args[1] } };
         }
 
         return .{ .invalid = .{ .unknown_command = cmd } };
@@ -231,6 +323,16 @@ pub fn writeReply(w: *std.Io.Writer, reply: engine.Reply) Error!void {
                 "-ERR wrong number of arguments for '{s}' command\r\n",
                 .{name},
             ),
+
+            // Encodings verified against Redis 8.8.2.
+            .invalid_expire => |name| try w.print(
+                "-ERR invalid expire time in '{s}' command\r\n",
+                .{name},
+            ),
+            .value_not_integer => try w.writeAll(
+                "-ERR value is not an integer or out of range\r\n",
+            ),
+            .syntax_error => try w.writeAll("-ERR syntax error\r\n"),
         },
     }
 }

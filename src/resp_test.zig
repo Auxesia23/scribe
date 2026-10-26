@@ -2,13 +2,13 @@
 //!
 //! Intended pipeline:
 //!
-//!     resp.readCommand -> ParsedCommand (owns argument bytes)
-//!     engine.execute(store, parsed.command) -> Reply
+//!     resp.readCommand(&arena, reader) -> engine.Command
+//!     engine.execute(store, command) -> Reply
 //!     resp.writeReply(writer, reply) -> bytes
-//!     parsed.deinit()
+//!     arena.reset(...)
 //!
-//! A `Reply` may borrow bytes from the store or from the parsed command, so it
-//! must be encoded before `parsed.deinit()` or before the next command runs.
+//! A `Reply` may borrow bytes from the store or from the command arena, so it
+//! must be encoded before the arena is reset.
 
 const std = @import("std");
 const engine = @import("engine.zig");
@@ -29,30 +29,51 @@ fn expectWritten(reply: engine.Reply, expected: []const u8) !void {
     try testing.expectEqualStrings(expected, out.written());
 }
 
-fn read(input: []const u8) !resp.ParsedCommand {
+const TestCommand = struct {
+    arena: std.heap.ArenaAllocator,
+    command: engine.Command,
+
+    fn deinit(self: *TestCommand) void {
+        self.arena.deinit();
+    }
+};
+
+fn read(input: []const u8) !TestCommand {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    errdefer arena.deinit();
+
     var r: std.Io.Reader = .fixed(input);
-    return resp.readCommand(testing.allocator, &r);
+    const command = try resp.readCommand(&arena, &r);
+
+    return .{ .arena = arena, .command = command };
 }
 
 fn expectReadError(input: []const u8, expected: anyerror) !void {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+
     var r: std.Io.Reader = .fixed(input);
-    try testing.expectError(expected, resp.readCommand(testing.allocator, &r));
+    try testing.expectError(expected, resp.readCommand(&arena, &r));
 }
 
 fn expectSession(store: *Store, input: []const u8, expected: []const u8) !void {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+
     var r: std.Io.Reader = .fixed(input);
     var out: std.Io.Writer.Allocating = .init(testing.allocator);
     defer out.deinit();
 
     while (true) {
-        var parsed = resp.readCommand(testing.allocator, &r) catch |err| switch (err) {
+        const command = resp.readCommand(&arena, &r) catch |err| switch (err) {
             error.EndOfStream => break,
             else => return err,
         };
-        defer parsed.deinit();
 
-        const reply = try engine.execute(store, parsed.command);
+        const reply = try engine.execute(store, command);
         try resp.writeReply(&out.writer, reply);
+
+        _ = arena.reset(.retain_capacity);
     }
 
     try testing.expectEqualStrings(expected, out.written());
@@ -270,11 +291,13 @@ test "readCommand: empty input is EndOfStream" {
 }
 
 test "readCommand: clean EOF after a complete command is EndOfStream" {
-    var r: std.Io.Reader = .fixed("PING\r\n");
-    var parsed = try resp.readCommand(testing.allocator, &r);
-    defer parsed.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
 
-    try testing.expectError(error.EndOfStream, resp.readCommand(testing.allocator, &r));
+    var r: std.Io.Reader = .fixed("PING\r\n");
+    _ = try resp.readCommand(&arena, &r);
+
+    try testing.expectError(error.EndOfStream, resp.readCommand(&arena, &r));
 }
 
 test "readCommand: EOF while reading argc is Truncated" {
@@ -387,13 +410,16 @@ test "readCommand: arguments outlive reader buffer refills" {
     var chunked: std.testing.Reader = .init(&reader_buffer, &.{.{ .buffer = input }});
     chunked.artificial_limit = .limited(1);
 
-    var parsed = try resp.readCommand(testing.allocator, &chunked.interface);
-    defer parsed.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
 
-    // Invalidate the source buffer; parsed arguments must be owned copies.
+    const command = try resp.readCommand(&arena, &chunked.interface);
+
+    // Invalidate the source buffer; parsed arguments must be copied into the
+    // arena.
     @memset(input_buffer[0..], 'x');
 
-    switch (parsed.command) {
+    switch (command) {
         .set => |set| {
             try testing.expectEqualStrings("name", set.key);
             try testing.expectEqualStrings("john", set.value);

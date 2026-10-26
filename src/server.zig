@@ -19,9 +19,12 @@ pub const Config = struct {
     port: u16 = 6379,
 };
 
+/// Keep the per-connection command arena small after a large request.
+const command_arena_retain_limit = 64 * 1024;
+
 pub const Server = struct {
-    // Scratch allocator for parsed commands. It must be thread-safe once
-    // connections are served concurrently.
+    // Backing allocator for per-connection command arenas. It must be
+    // thread-safe once connections are served concurrently.
     allocator: std.mem.Allocator,
     io: std.Io,
     store: *Store,
@@ -69,13 +72,16 @@ pub const Server = struct {
             };
             defer stream.close(self.io);
 
+            var arena = std.heap.ArenaAllocator.init(self.allocator);
+            defer arena.deinit();
+
             var read_buf: [8 * 1024]u8 = undefined;
             var write_buf: [4 * 1024]u8 = undefined;
             var r = stream.reader(self.io, &read_buf);
             var w = stream.writer(self.io, &write_buf);
 
             while (true) {
-                var parsed = resp.readCommand(self.allocator, &r.interface) catch |err| switch (err) {
+                const command = resp.readCommand(&arena, &r.interface) catch |err| switch (err) {
                     error.EndOfStream,
                     error.Truncated,
                     error.BadProtocol,
@@ -84,14 +90,17 @@ pub const Server = struct {
                     error.WriteFailed,
                     => break,
                 };
-                defer parsed.deinit();
 
-                const reply = engine.execute(self.store, parsed.command) catch |err| switch (err) {
+                const reply = engine.execute(self.store, command) catch |err| switch (err) {
                     error.OutOfMemory => break,
                 };
 
                 resp.writeReply(&w.interface, reply) catch break;
                 w.interface.flush() catch break;
+
+                // The reply is fully flushed; command slices are no longer
+                // needed. Keep small buffers for the next command.
+                _ = arena.reset(.{ .retain_with_limit = command_arena_retain_limit });
             }
         }
     }

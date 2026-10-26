@@ -3,8 +3,9 @@
 //! `readCommand` parses one command and maps it to an `engine.Command`.
 //! `writeReply` encodes an `engine.Reply` as RESP2 bytes.
 //!
-//! Parsed argument bytes are owned by `ParsedCommand`; call `deinit` after the
-//! command has been executed and its reply encoded.
+//! Parsed argument bytes live in the caller-provided arena. They remain valid
+//! until the arena is reset or deinitialized, so encode the reply before
+//! resetting it.
 
 const std = @import("std");
 const engine = @import("engine.zig");
@@ -36,22 +37,14 @@ pub const Error = error{
     OutOfMemory,
 };
 
-const ArgList = std.ArrayList([]const u8);
-
 /// Parses one command at a time from a reader.
 const Parser = struct {
     r: *std.Io.Reader,
     allocator: std.mem.Allocator,
-    args: ArgList = .empty,
+    args: std.ArrayList([]const u8) = .empty,
 
     fn init(r: *std.Io.Reader, allocator: std.mem.Allocator) Parser {
         return .{ .r = r, .allocator = allocator };
-    }
-
-    fn deinit(self: *Parser) void {
-        for (self.args.items) |arg| self.allocator.free(arg);
-        self.args.deinit(self.allocator);
-        self.args = .empty;
     }
 
     /// Parses one command, or returns `null` when the stream ends cleanly
@@ -119,10 +112,9 @@ const Parser = struct {
         while (tokens.next()) |token| {
             if (self.args.items.len == max_args) return error.BadProtocol;
 
-            // Token slices point into the reader buffer, so own a copy before
-            // the next read can refill that buffer.
+            // Token slices point into the reader buffer, so copy them into the
+            // arena before the next read can refill that buffer.
             const owned = try self.allocator.dupe(u8, token);
-            errdefer self.allocator.free(owned);
             try self.args.append(self.allocator, owned);
         }
     }
@@ -149,7 +141,6 @@ const Parser = struct {
             if (total_declared > max_command_len) return error.BadProtocol;
 
             const body = try self.allocator.alloc(u8, len);
-            errdefer self.allocator.free(body);
 
             self.r.readSliceAll(body) catch |err| switch (err) {
                 error.EndOfStream => return error.Truncated,
@@ -203,38 +194,15 @@ const Parser = struct {
     }
 };
 
-/// One parsed command plus the argument storage it borrows from.
-pub const ParsedCommand = struct {
-    command: engine.Command,
-    /// Heap-backed argument list. Keeping the list on the heap makes the
-    /// slices stored in `command` stable after this struct is returned.
-    args: ArgList = .empty,
-    allocator: std.mem.Allocator,
-
-    /// Releases storage owned by this parsed command.
-    pub fn deinit(self: *ParsedCommand) void {
-        for (self.args.items) |arg| self.allocator.free(arg);
-        self.args.deinit(self.allocator);
-        self.args = .empty;
-    }
-};
-
-/// Reads exactly one command from `r`.
+/// Reads exactly one command from `r` and stores argument bytes in `arena`.
 ///
 /// Returns `error.EndOfStream` when the peer closed the connection between
 /// commands. Framing errors leave the stream in an undefined position; the
-/// caller must close the connection.
-pub fn readCommand(allocator: std.mem.Allocator, r: *std.Io.Reader) Error!ParsedCommand {
-    var parser: Parser = .init(r, allocator);
-    errdefer parser.deinit();
-
-    const command = (try parser.next()) orelse return error.EndOfStream;
-
-    return .{
-        .command = command,
-        .args = parser.args,
-        .allocator = allocator,
-    };
+/// caller must close the connection. On error, partially parsed arguments
+/// remain in the arena; reset or deinitialize it before reusing the arena.
+pub fn readCommand(arena: *std.heap.ArenaAllocator, r: *std.Io.Reader) Error!engine.Command {
+    var parser: Parser = .init(r, arena.allocator());
+    return (try parser.next()) orelse error.EndOfStream;
 }
 
 /// Writes one RESP2 reply. The writer is not flushed.

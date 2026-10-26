@@ -109,16 +109,17 @@ Planned: `event_loop.zig` for the multi-connection epoll loop.
 - `Store.get` returns a **borrowed** slice. It is only valid until that key is
   overwritten/removed, or the store is cleared/deinitialized.
 - `Store.getCopy` returns caller-owned memory that must be freed by the caller.
-- Protocol arguments are copied into `ParsedCommand` storage and freed after the
-  reply is encoded, so nothing points into the reader's buffer.
+- Protocol arguments are copied into a per-command arena and freed by resetting
+  that arena after the reply is encoded, so nothing points into the reader's
+  buffer.
 
 ### Protocol
 
-`resp.readCommand` parses exactly one command into a `ParsedCommand` that owns
-the argument bytes. `engine.execute` runs the command against the `Store` and
-returns a `Reply`. `resp.writeReply` encodes that reply as RESP2 bytes. The
-transport only supplies a reader and a writer, so the codec and engine can be
-tested entirely in memory.
+`resp.readCommand` parses exactly one command into an `engine.Command` backed by
+a caller-provided arena. `engine.execute` runs the command against the `Store`
+and returns a `Reply`. `resp.writeReply` encodes that reply as RESP2 bytes, and
+the server resets the arena after flushing. The transport only supplies a reader
+and a writer, so the codec and engine can be tested entirely in memory.
 
 The error contract distinguishes:
 

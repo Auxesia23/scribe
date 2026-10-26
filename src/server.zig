@@ -1,7 +1,7 @@
 //! TCP transport for the key-value server.
 //!
-//! This is the only module that knows about `std.Io.net`. The protocol layer
-//! only receives a `std.Io.Reader` and a `std.Io.Writer`.
+//! This is the only module that knows about `std.Io.net`. The RESP codec only
+//! receives a `std.Io.Reader` and a `std.Io.Writer`.
 //!
 //! Errors are connection-scoped: `EndOfStream` and framing errors close one
 //! connection and leave the server running. Only listener failures abort
@@ -9,7 +9,8 @@
 
 const std = @import("std");
 const Store = @import("store.zig").Store;
-const protocol = @import("protocol.zig");
+const engine = @import("engine.zig");
+const resp = @import("resp.zig");
 
 pub const Config = struct {
     /// Address to bind.
@@ -19,8 +20,8 @@ pub const Config = struct {
 };
 
 pub const Server = struct {
-    // Scratch allocator passed to `protocol.execute`. It must be thread-safe
-    // once connections are served concurrently.
+    // Scratch allocator for parsed commands. It must be thread-safe once
+    // connections are served concurrently.
     allocator: std.mem.Allocator,
     io: std.Io,
     store: *Store,
@@ -56,8 +57,8 @@ pub const Server = struct {
     /// Accepts and serves connections until `stop` is called.
     ///
     /// Connections are handled one at a time. The read buffer must be larger
-    /// than `protocol.max_line_len`, otherwise `takeDelimiter` cannot see the
-    /// delimiter and legal input is rejected as `BadProtocol`.
+    /// than `resp.max_line_len`, otherwise the delimiter may not fit in the
+    /// reader buffer and legal input is rejected as `BadProtocol`.
     pub fn serve(self: *Server) !void {
         defer self.running.store(false, .release);
         while (self.running.load(.acquire)) {
@@ -74,15 +75,22 @@ pub const Server = struct {
             var w = stream.writer(self.io, &write_buf);
 
             while (true) {
-                protocol.execute(self.store, self.allocator, &r.interface, &w.interface) catch |err| switch (err) {
+                var parsed = resp.readCommand(self.allocator, &r.interface) catch |err| switch (err) {
                     error.EndOfStream,
                     error.Truncated,
                     error.BadProtocol,
                     error.ReadFailed,
-                    error.WriteFailed,
                     error.OutOfMemory,
+                    error.WriteFailed,
                     => break,
                 };
+                defer parsed.deinit();
+
+                const reply = engine.execute(self.store, parsed.command) catch |err| switch (err) {
+                    error.OutOfMemory => break,
+                };
+
+                resp.writeReply(&w.interface, reply) catch break;
                 w.interface.flush() catch break;
             }
         }

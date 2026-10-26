@@ -427,7 +427,7 @@ test "serve: malformed array header closes only that connection" {
     }
 
     try bad.open(io, server.port());
-    // Announces more arguments than `protocol.max_args` allows.
+    // Announces more arguments than `resp.max_args` allows.
     try bad.send("*99999999\r\n");
     try bad.expectClosed();
     bad.deinit();
@@ -458,7 +458,7 @@ test "serve: oversized bulk length closes only that connection" {
     }
 
     try bad.open(io, server.port());
-    // 2,000,000 bytes is above `protocol.max_bulk_len` (1 MiB).
+    // 2,000,000 bytes is above `resp.max_bulk_len` (1 MiB).
     try bad.send("*2\r\n$2000000\r\n");
     try bad.expectClosed();
     bad.deinit();
